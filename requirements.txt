@@ -1,0 +1,3 @@
+# Python 3.11 runtime – no extra packages needed (stdlib only for the proxy)
+# ffmpeg is NOT available on Render free tier; audio conversion is disabled.
+# The proxy still handles: CORS bridging, m3u8 rewriting, /probe, /subs (if ffmpeg installed)
