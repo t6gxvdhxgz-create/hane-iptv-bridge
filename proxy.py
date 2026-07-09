@@ -221,15 +221,6 @@ class Proxy(BaseHTTPRequestHandler):
                 ff.kill()
             except Exception:
                 pass
-                    break
-                self.wfile.write(chunk)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            pass
-        finally:
-            try:
-                ff.kill()
-            except Exception:
-                pass
     def _do_fix(self, parsed):
         """Audio-fix / enhancement: audio -> AAC; optionally denoise+sharpen video
         (enhance=1, ideas borrowed from AI enhancers, done in realtime ffmpeg)."""
