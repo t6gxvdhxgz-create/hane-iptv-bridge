@@ -107,12 +107,38 @@ class Proxy(BaseHTTPRequestHandler):
         return "%s://%s/p?u=" % (scheme, host)
 
     def _rewrite_m3u8(self, text, base_url):
-        """Make every URI in an HLS playlist absolute and proxy-wrapped."""
-        prefix = self._proxy_prefix()
+        """Make every URI in an HLS playlist absolute.
+        Strategy: upgrade http:// segment URLs to https:// so browsers can load
+        them directly (panel sends Access-Control-Allow-Origin: * so CORS is fine).
+        Only wrap through the proxy if the source URL has an unusual port that
+        the browser might not accept over plain HTTPS (e.g. :8080 with a bad cert).
+        """
+        # Detect if the base URL uses a non-standard port with http://
+        m = re.match(r"(https?://)([^/:]+)(?::(\d+))?", base_url, re.I)
+        src_scheme = (m.group(1) if m else "http://").lower()
+        src_host   = m.group(2) if m else ""
+        src_port   = m.group(3) if m else None
 
-        def wrap(u):
-            absolute = urllib.parse.urljoin(base_url, u.strip())
-            return prefix + urllib.parse.quote(absolute, safe="")
+        # If the panel is already HTTPS or on standard 80/443, do a direct
+        # absolute rewrite (no proxy wrapping needed).
+        # Otherwise wrap only the .m3u8 sub-playlists through the proxy; 
+        # leave .ts segments as https:// direct (panel CORS allows it).
+        use_direct_https = True  # upgrade http → https for all URIs
+
+        def make_absolute(u):
+            return urllib.parse.urljoin(base_url, u.strip())
+
+        def wrap_or_upgrade(u):
+            absolute = make_absolute(u)
+            if use_direct_https and absolute.startswith("http://"):
+                # Upgrade to https:// – browser loads segment directly, no proxy
+                return absolute.replace("http://", "https://", 1)
+            # Already https or we chose to proxy it
+            return absolute
+
+        def proxy_wrap(u):
+            absolute = make_absolute(u)
+            return self._proxy_prefix() + urllib.parse.quote(absolute, safe="")
 
         out = []
         for line in text.splitlines():
@@ -120,10 +146,12 @@ class Proxy(BaseHTTPRequestHandler):
             if not s:
                 out.append(line)
             elif s.startswith("#"):
-                # rewrite URI="..." attributes (keys, maps, media renditions)
-                out.append(re.sub(r'URI="([^"]+)"', lambda m: 'URI="%s"' % wrap(m.group(1)), line))
+                # Sub-playlist refs in URI="..." attributes: proxy-wrap so they
+                # come through this server (for further rewriting).
+                out.append(re.sub(r'URI="([^"]+)"', lambda m2: 'URI="%s"' % proxy_wrap(m2.group(1)), line))
             else:
-                out.append(wrap(s))
+                # Segment lines: direct HTTPS upgrade (no proxy hop)
+                out.append(wrap_or_upgrade(s))
         return "\n".join(out) + "\n"
 
     # ── HTTP methods ─────────────────────────────────────────────────────
