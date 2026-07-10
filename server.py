@@ -25,3 +25,4 @@ if __name__ == "__main__":
     httpd = ThreadingHTTPServer(addr, proxy.Proxy)
     print(f"HaNe IPTV bridge listening on port {PORT}", flush=True)
     httpd.serve_forever()
+
