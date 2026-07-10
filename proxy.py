@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-HaNe IPTV Proxy v3
+HaNe IPTV Proxy v4.1
 ==================
 A resilient, zero-dependency HTTPS -> HTTP bridge for Xtream/HLS/video streams.
 
-Python: 3.8+
+Python: 3.9+
 
 Endpoints
 ---------
@@ -47,6 +47,14 @@ import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Deque, Dict, IO, Iterable, List, Mapping, Optional, Tuple, cast
+
+
+# ---------------------------------------------------------------------------
+# Build information
+# ---------------------------------------------------------------------------
+
+SERVICE_NAME = "hane-iptv-bridge"
+VERSION = "4.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -93,9 +101,9 @@ READ_TIMEOUT = env_float("READ_TIMEOUT", 45.0, 1.0, 600.0)
 CLIENT_TIMEOUT = env_float("CLIENT_TIMEOUT", 60.0, 1.0, 600.0)
 UPSTREAM_RETRIES = env_int("UPSTREAM_RETRIES", 2, 0, 8)
 MAX_REDIRECTS = env_int("MAX_REDIRECTS", 5, 0, 12)
-MAX_CONNECTIONS = env_int("MAX_CONNECTIONS", 128, 4, 4096)
-MAX_FFMPEG_JOBS = env_int("MAX_FFMPEG_JOBS", 3, 1, 64)
-MAX_PROBE_JOBS = env_int("MAX_PROBE_JOBS", 2, 1, 32)
+MAX_CONNECTIONS = env_int("MAX_CONNECTIONS", 64, 4, 4096)
+MAX_FFMPEG_JOBS = env_int("MAX_FFMPEG_JOBS", 1 if os.environ.get("RENDER") else 3, 1, 64)
+MAX_PROBE_JOBS = env_int("MAX_PROBE_JOBS", 1 if os.environ.get("RENDER") else 2, 1, 32)
 FFMPEG_START_TIMEOUT = env_float("FFMPEG_START_TIMEOUT", 20.0, 1.0, 120.0)
 FFPROBE_TIMEOUT = env_float("FFPROBE_TIMEOUT", 35.0, 1.0, 180.0)
 FFMPEG_RW_TIMEOUT_US = env_int("FFMPEG_RW_TIMEOUT_US", 30_000_000, 1_000_000, 600_000_000)
@@ -103,8 +111,17 @@ MAX_PLAYLIST_BYTES = env_int("MAX_PLAYLIST_BYTES", 8 * 1024 * 1024, 64 * 1024, 6
 MAX_PROBE_OUTPUT = env_int("MAX_PROBE_OUTPUT", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024)
 MAX_URL_LENGTH = env_int("MAX_URL_LENGTH", 16 * 1024, 1024, 128 * 1024)
 HLS_SIGNATURE_TTL = env_int("HLS_SIGNATURE_TTL", 12 * 60 * 60, 60, 7 * 24 * 60 * 60)
-ALLOW_PRIVATE_TARGETS = env_bool("ALLOW_PRIVATE_TARGETS", True)
+ALLOW_PRIVATE_TARGETS = env_bool("ALLOW_PRIVATE_TARGETS", False)
 CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*").strip() or "*"
+PUBLIC_STATUS = env_bool("PUBLIC_STATUS", True)
+PUBLIC_METRICS = env_bool("PUBLIC_METRICS", False)
+PLATFORM_DEPLOYMENT = bool(
+    os.environ.get("RENDER")
+    or os.environ.get("RAILWAY_ENVIRONMENT")
+    or os.environ.get("FLY_APP_NAME")
+)
+REQUIRE_PROXY_TOKEN = env_bool("REQUIRE_PROXY_TOKEN", PLATFORM_DEPLOYMENT)
+SERVER_BACKLOG = env_int("SERVER_BACKLOG", 256, 16, 65535)
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "").strip()
 SIGNING_SECRET = os.environ.get("PROXY_SIGNING_SECRET", "").strip() or PROXY_TOKEN
 APK_PATH = os.environ.get("APK_PATH", "").strip()
@@ -485,7 +502,7 @@ def set_upstream_read_timeout(response: object, timeout: float) -> None:
 class LimitedThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
-    request_queue_size = 256
+    request_queue_size = SERVER_BACKLOG
 
     def __init__(self, server_address, handler_class):  # type: ignore[no-untyped-def]
         self._connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
@@ -535,7 +552,7 @@ class LimitedThreadingHTTPServer(ThreadingHTTPServer):
 
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "HaNeIPTVProxy/3.0"
+    server_version = f"HaNeIPTVProxy/{VERSION}"
     sys_version = ""
 
     def setup(self) -> None:
@@ -552,6 +569,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._cors_headers()
         self.send_header("X-Request-ID", self.request_id)
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         if content_type:
             self.send_header("Content-Type", content_type)
 
@@ -608,7 +627,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _master_token_valid(self, query: Mapping[str, List[str]]) -> bool:
         if not PROXY_TOKEN:
-            return True
+            return not REQUIRE_PROXY_TOKEN
         candidates = [
             query.get("token", [""])[0],
             self.headers.get("X-Proxy-Token", ""),
@@ -620,7 +639,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _authorized(self, parsed: urllib.parse.ParseResult, query: Mapping[str, List[str]]) -> bool:
         if not PROXY_TOKEN:
-            return True
+            return not REQUIRE_PROXY_TOKEN
         if self._master_token_valid(query):
             return True
         if parsed.path == "/p":
@@ -748,28 +767,63 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._route(head_only=False)
 
+    def _method_not_allowed(self) -> None:
+        self._start_response(405, "text/plain; charset=utf-8")
+        self.send_header("Allow", "GET, HEAD, OPTIONS")
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    do_POST = _method_not_allowed
+    do_PUT = _method_not_allowed
+    do_PATCH = _method_not_allowed
+    do_DELETE = _method_not_allowed
+    do_CONNECT = _method_not_allowed
+    do_TRACE = _method_not_allowed
+
     def _route(self, head_only: bool) -> None:
         METRICS.add("requests_total")
         started = time.monotonic()
         try:
+            if len(self.path) > MAX_URL_LENGTH + 2048:
+                return self._send_error_text(414, "Request target is too long", head_only)
+
             parsed = urllib.parse.urlparse(self.path)
             query = parse_query(parsed)
-            if parsed.path not in {"/health"} and not self._authorized(parsed, query):
-                return self._send_error_text(401, "Unauthorized", head_only)
+            path = parsed.path or "/"
 
-            if parsed.path == "/health":
+            public_paths = {"/", "/health", "/live", "/ready", "/favicon.ico"}
+            is_public = PUBLIC_STATUS and path in public_paths
+            if path == "/metrics" and PUBLIC_METRICS:
+                is_public = True
+
+            if not is_public:
+                if REQUIRE_PROXY_TOKEN and not PROXY_TOKEN:
+                    return self._send_error_text(503, "Proxy authentication is not configured", head_only)
+                if not self._authorized(parsed, query):
+                    return self._send_error_text(401, "Unauthorized", head_only)
+
+            if path == "/":
+                return self._handle_root(head_only)
+            if path == "/favicon.ico":
+                return self._handle_favicon()
+            if path == "/health":
                 return self._handle_health(head_only)
-            if parsed.path == "/metrics":
+            if path == "/live":
+                return self._handle_live(head_only)
+            if path == "/ready":
+                return self._handle_ready(head_only)
+            if path == "/metrics":
                 return self._handle_metrics(head_only)
-            if parsed.path == "/p":
+            if path == "/p":
                 return self._handle_proxy(query, head_only)
-            if parsed.path == "/probe":
+            if path == "/probe":
                 return self._handle_probe(query, head_only)
-            if parsed.path == "/subs":
+            if path == "/subs":
                 return self._handle_subtitles(query, head_only)
-            if parsed.path == "/fix":
+            if path == "/fix":
                 return self._handle_fix(query, head_only)
-            if parsed.path == "/apk":
+            if path == "/apk":
                 return self._handle_apk(head_only)
             return self._send_error_text(404, "Unknown endpoint", head_only)
         except ValueError as exc:
@@ -778,7 +832,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, socket.timeout):
             log_event("info", "client_disconnected", request_id=self.request_id)
         except Exception as exc:
-            log_event("error", "unhandled_request_exception", request_id=self.request_id, error=repr(exc))
+            log_event(
+                "error",
+                "unhandled_request_exception",
+                request_id=self.request_id,
+                error_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
             if not self._response_started:
                 return self._send_error_text(500, "Internal proxy error", head_only)
         finally:
@@ -787,6 +847,53 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 log_event("info", "slow_request", request_id=self.request_id, elapsed_ms=elapsed_ms)
 
     # ----- endpoint handlers -----------------------------------------------
+
+    def _handle_root(self, head_only: bool) -> None:
+        payload = {
+            "service": SERVICE_NAME,
+            "name": "HaNe IPTV Bridge",
+            "version": VERSION,
+            "status": "online",
+            "health": "/health",
+            "live": "/live",
+            "ready": "/ready",
+            "authentication_required": REQUIRE_PROXY_TOKEN,
+            "authentication_configured": bool(PROXY_TOKEN),
+            "ffmpeg": bool(FFMPEG),
+            "ffprobe": bool(FFPROBE),
+        }
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self._send_bytes(
+            200,
+            body,
+            "application/json; charset=utf-8",
+            head_only,
+            cache_control="no-store",
+        )
+
+    def _handle_favicon(self) -> None:
+        self._start_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+
+    def _handle_live(self, head_only: bool) -> None:
+        body = b'{"status":"alive"}'
+        self._send_bytes(200, body, "application/json; charset=utf-8", head_only)
+
+    def _handle_ready(self, head_only: bool) -> None:
+        ready = not (REQUIRE_PROXY_TOKEN and not PROXY_TOKEN)
+        payload = {
+            "status": "ready" if ready else "not_ready",
+            "authentication_configured": bool(PROXY_TOKEN),
+        }
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self._send_bytes(
+            200 if ready else 503,
+            body,
+            "application/json; charset=utf-8",
+            head_only,
+        )
 
     def _handle_health(self, head_only: bool) -> None:
         snapshot = METRICS.snapshot()
@@ -798,11 +905,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not FFPROBE:
             status = "degraded"
             reasons.append("ffprobe not found: /probe unavailable")
+        if REQUIRE_PROXY_TOKEN and not PROXY_TOKEN:
+            status = "degraded"
+            reasons.append("PROXY_TOKEN is required but not configured")
 
         payload = {
             "status": status,
-            "version": "3.0",
+            "service": SERVICE_NAME,
+            "version": VERSION,
             "uptime_seconds": int(time.time() - STARTED_AT),
+            "authentication_required": REQUIRE_PROXY_TOKEN,
+            "authentication_configured": bool(PROXY_TOKEN),
             "ffmpeg": bool(FFMPEG),
             "ffprobe": bool(FFPROBE),
             "active_connections": snapshot.get("active_connections", 0),
@@ -817,7 +930,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         lines = [
             "# HELP hane_proxy_info Static proxy build information.",
             "# TYPE hane_proxy_info gauge",
-            'hane_proxy_info{version="3.0"} 1',
+            f'hane_proxy_info{{service="{SERVICE_NAME}",version="{VERSION}"}} 1',
         ]
         for name in sorted(snapshot):
             metric_name = "hane_proxy_" + re.sub(r"[^a-zA-Z0-9_:]", "_", name)
@@ -837,7 +950,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 request.add_header(header, safe_header_value(value))
         request.add_header("Accept-Encoding", "identity")
         if not request.has_header("User-agent"):
-            request.add_header("User-Agent", "HaNeIPTV/3.0")
+            request.add_header("User-Agent", f"HaNeIPTV/{VERSION}")
 
         try:
             upstream = self._open_upstream(request)
@@ -1254,15 +1367,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    if PROXY_TOKEN and len(PROXY_TOKEN) < 16:
-        log_event("warning", "weak_proxy_token", message="Use a random token of at least 16 characters")
-    if not PROXY_TOKEN:
+    if PROXY_TOKEN and len(PROXY_TOKEN) < 24:
+        log_event("warning", "weak_proxy_token", message="Use a random token of at least 24 characters")
+    if REQUIRE_PROXY_TOKEN and not PROXY_TOKEN:
+        log_event(
+            "error",
+            "authentication_required_but_missing",
+            message="Public status endpoints will work, but proxy endpoints stay disabled until PROXY_TOKEN is set",
+        )
+    elif not PROXY_TOKEN:
         log_event("warning", "authentication_disabled", message="Set PROXY_TOKEN before exposing the proxy publicly")
     if ALLOW_PRIVATE_TARGETS and not ALLOWED_HOST_PATTERNS:
         log_event(
             "warning",
             "broad_target_access",
-            message="Private targets and all hosts are allowed; use PROXY_TOKEN and preferably ALLOWED_HOSTS",
+            message="Private targets and all hosts are allowed; configure PROXY_TOKEN and ALLOWED_HOSTS",
         )
 
     server = LimitedThreadingHTTPServer((BIND_HOST, PORT), ProxyHandler)
@@ -1286,12 +1405,18 @@ def main() -> None:
     log_event(
         "info",
         "proxy_started",
+        service=SERVICE_NAME,
+        version=VERSION,
         bind=BIND_HOST,
         port=PORT,
         ffmpeg=FFMPEG or "not-found",
         ffprobe=FFPROBE or "not-found",
         max_connections=MAX_CONNECTIONS,
         max_ffmpeg_jobs=MAX_FFMPEG_JOBS,
+        authentication_required=REQUIRE_PROXY_TOKEN,
+        authentication_configured=bool(PROXY_TOKEN),
+        allow_private_targets=ALLOW_PRIVATE_TARGETS,
+        allowed_hosts=list(ALLOWED_HOST_PATTERNS),
     )
 
     try:
