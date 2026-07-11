@@ -291,9 +291,9 @@ class Proxy(BaseHTTPRequestHandler):
             absolute = make_absolute(u)
             if use_direct_https and absolute.startswith("http://"):
                 # Upgrade to https:// – browser loads segment directly, no proxy
-                return absolute.replace("http://", "https://", 1)
+                return proxy_wrap(u)
             # Already https or we chose to proxy it
-            return absolute
+            return proxy_wrap(u)
 
         def proxy_wrap(u):
             absolute = make_absolute(u)
