@@ -12,6 +12,9 @@ GET/HEAD /p?u=<url>                     Direct proxy with Range support
 GET      /probe?src=<url>               Stream/audio/subtitle metadata
 GET      /subs?src=<url>&index=0         Embedded subtitle -> WebVTT
 GET      /fix?src=<url>&audio=0&t=0      Browser-compatible fragmented MP4
+GET      /subtitle-status                SubDL configuration status
+GET      /subtitle-search?...            Search SubDL subtitles
+GET      /subtitle-file?id=<opaque-id>    Download a selected subtitle
 GET/HEAD /apk                            Serve APK configured by APK_PATH
 GET      /health                         Health/readiness JSON
 GET      /metrics                        Prometheus-style metrics
@@ -24,7 +27,9 @@ URLs, browser history, or player logs.
 """
 from __future__ import annotations
 
+import base64
 import glob
+import io
 import hashlib
 import hmac
 import ipaddress
@@ -44,6 +49,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Deque, Dict, IO, Iterable, List, Mapping, Optional, Tuple, cast
@@ -54,7 +60,7 @@ from typing import Deque, Dict, IO, Iterable, List, Mapping, Optional, Tuple, ca
 # ---------------------------------------------------------------------------
 
 SERVICE_NAME = "hane-iptv-bridge"
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +131,30 @@ SERVER_BACKLOG = env_int("SERVER_BACKLOG", 256, 16, 65535)
 PROXY_TOKEN = os.environ.get("PROXY_TOKEN", "").strip()
 SIGNING_SECRET = os.environ.get("PROXY_SIGNING_SECRET", "").strip() or PROXY_TOKEN
 APK_PATH = os.environ.get("APK_PATH", "").strip()
+
+# SubDL subtitle provider. The environment variable takes priority so this
+# built-in key can be rotated without another code deployment.
+SUBDL_API_KEY = os.environ.get(
+    "SUBDL_API_KEY",
+    "subdl_dH3eDpdE9xNweEjifm-iFta7lx9LG_A9isSydmuxsaU",
+).strip()
+SUBDL_API_URL = os.environ.get(
+    "SUBDL_API_URL",
+    "https://api.subdl.com/api/v1/subtitles",
+).strip()
+SUBDL_DOWNLOAD_BASE = "https://dl.subdl.com"
+SUBTITLE_RATE_LIMIT = env_int("SUBTITLE_RATE_LIMIT", 120, 10, 10_000)
+SUBTITLE_MAX_BYTES = env_int("SUBTITLE_MAX_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024)
+SUBTITLE_PROVIDER_MAX_BYTES = env_int(
+    "SUBTITLE_PROVIDER_MAX_BYTES",
+    4 * 1024 * 1024,
+    64 * 1024,
+    32 * 1024 * 1024,
+)
+SUBTITLE_TIMEOUT = env_float("SUBTITLE_TIMEOUT", 18.0, 1.0, 120.0)
+
+_SUBTITLE_HITS: Dict[str, List[float]] = {}
+_SUBTITLE_HITS_LOCK = threading.Lock()
 
 ALLOWED_HOST_PATTERNS = tuple(
     item.strip().lower().rstrip(".")
@@ -495,6 +525,176 @@ def set_upstream_read_timeout(response: object, timeout: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SubDL helpers
+# ---------------------------------------------------------------------------
+
+
+def subtitle_language(value: object) -> str:
+    raw = str(value or "").strip().lower()
+    aliases = {
+        "dutch": "NL",
+        "nederlands": "NL",
+        "dut": "NL",
+        "nld": "NL",
+        "english": "EN",
+        "eng": "EN",
+        "turkish": "TR",
+        "turkce": "TR",
+        "türkçe": "TR",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    cleaned = re.sub(r"[^a-z]", "", raw)
+    return cleaned[:3].upper()
+
+
+def optional_int(value: object) -> Optional[int]:
+    """Convert a loosely typed provider value to int without upsetting strict type checkers."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def decode_subtitle_bytes(data: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def encode_subtitle_download_id(url: str) -> str:
+    encoded = base64.urlsafe_b64encode(url.encode("utf-8")).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def decode_subtitle_download_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,2048}", value):
+        raise ValueError("invalid subtitle id")
+    padding = "=" * (-len(value) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(value + padding).decode("utf-8")
+    except Exception as exc:
+        raise ValueError("invalid subtitle id") from exc
+    parsed = urllib.parse.urlsplit(decoded)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != "dl.subdl.com":
+        raise ValueError("invalid subtitle download host")
+    if not parsed.path.startswith("/subtitle/"):
+        raise ValueError("invalid subtitle download path")
+    return decoded
+
+
+def subdl_request(params: Mapping[str, object]) -> Mapping[str, object]:
+    if not SUBDL_API_KEY:
+        raise RuntimeError("subtitle provider is not configured")
+    query = {key: str(value) for key, value in params.items() if value not in (None, "")}
+    query["api_key"] = SUBDL_API_KEY
+    url = SUBDL_API_URL + "?" + urllib.parse.urlencode(query)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": f"HaNeIPTV/{VERSION}",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=SUBTITLE_TIMEOUT) as response:
+        raw = response.read(SUBTITLE_PROVIDER_MAX_BYTES + 1)
+    if len(raw) > SUBTITLE_PROVIDER_MAX_BYTES:
+        raise ValueError("subtitle provider response is too large")
+    payload = json.loads(raw.decode("utf-8", "replace") or "{}")
+    if not isinstance(payload, dict):
+        raise ValueError("subtitle provider returned invalid JSON")
+    return payload
+
+
+def subtitle_candidates(
+    payload: Mapping[str, object],
+    wanted_languages: List[str],
+    season: Optional[int],
+    episode: Optional[int],
+) -> List[Dict[str, object]]:
+    raw_subtitles = payload.get("subtitles")
+    if not isinstance(raw_subtitles, list):
+        return []
+
+    candidates: List[Dict[str, object]] = []
+    seen_urls = set()
+
+    def append_candidate(item: Mapping[str, object], parent: Optional[Mapping[str, object]] = None) -> None:
+        parent = parent or {}
+        raw_url = str(item.get("url") or parent.get("url") or "").strip()
+        if not raw_url:
+            return
+        absolute_url = urllib.parse.urljoin(SUBDL_DOWNLOAD_BASE + "/", raw_url)
+        parsed = urllib.parse.urlsplit(absolute_url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() != "dl.subdl.com":
+            return
+        if not parsed.path.startswith("/subtitle/") or absolute_url in seen_urls:
+            return
+
+        language = subtitle_language(item.get("language") or parent.get("language"))
+        item_season = item.get("season") if item.get("season") is not None else parent.get("season")
+        item_episode = item.get("episode") if item.get("episode") is not None else parent.get("episode")
+        normalized_season = optional_int(item_season)
+        normalized_episode = optional_int(item_episode)
+
+        if season is not None and normalized_season not in (None, season):
+            return
+        if episode is not None and normalized_episode not in (None, episode):
+            return
+
+        name = str(item.get("name") or item.get("release_name") or parent.get("release_name") or "Subtitle").strip()
+        release = str(item.get("release_name") or parent.get("release_name") or name).strip()
+        file_format = str(item.get("format") or os.path.splitext(name)[1].lstrip(".") or "zip").lower()
+        seen_urls.add(absolute_url)
+        candidates.append({
+            "id": encode_subtitle_download_id(absolute_url),
+            "lang": language.lower(),
+            "language": language,
+            "label": name,
+            "release": release,
+            "format": file_format,
+            "season": normalized_season,
+            "episode": normalized_episode,
+            "hearing_impaired": bool(item.get("hi") if item.get("hi") is not None else parent.get("hi")),
+            "fps": item.get("fps") if item.get("fps") is not None else parent.get("fps"),
+        })
+
+    for subtitle in raw_subtitles:
+        if not isinstance(subtitle, dict):
+            continue
+        unpack_files = subtitle.get("unpack_files")
+        if isinstance(unpack_files, list) and unpack_files:
+            for unpacked in unpack_files:
+                if isinstance(unpacked, dict):
+                    append_candidate(unpacked, subtitle)
+        else:
+            append_candidate(subtitle)
+
+    language_order = {language: index for index, language in enumerate(wanted_languages)}
+    candidates.sort(
+        key=lambda item: (
+            language_order.get(str(item.get("language") or ""), len(language_order)),
+            1 if item.get("hearing_impaired") else 0,
+            str(item.get("release") or "").lower(),
+        )
+    )
+    return candidates[:30]
+
+
+# ---------------------------------------------------------------------------
 # Bounded HTTP server
 # ---------------------------------------------------------------------------
 
@@ -664,6 +864,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             params["sig"] = sign_target(target, expires)
         return "/p?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
 
+    def _subtitle_rate_ok(self) -> bool:
+        forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        client = forwarded or (self.client_address[0] if self.client_address else "unknown")
+        now = time.time()
+        with _SUBTITLE_HITS_LOCK:
+            recent = [stamp for stamp in _SUBTITLE_HITS.get(client, []) if now - stamp < 3600]
+            if len(recent) >= SUBTITLE_RATE_LIMIT:
+                _SUBTITLE_HITS[client] = recent
+                return False
+            recent.append(now)
+            _SUBTITLE_HITS[client] = recent
+        return True
+
     def _rewrite_m3u8(self, text: str, base_url: str) -> str:
         def wrap(uri: str) -> str:
             cleaned = uri.strip()
@@ -823,6 +1036,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return self._handle_subtitles(query, head_only)
             if path == "/fix":
                 return self._handle_fix(query, head_only)
+            if path == "/subtitle-status":
+                return self._handle_subtitle_status(head_only)
+            if path == "/subtitle-search":
+                return self._handle_subtitle_search(query, head_only)
+            if path == "/subtitle-file":
+                return self._handle_subtitle_file(query, head_only)
             if path == "/apk":
                 return self._handle_apk(head_only)
             return self._send_error_text(404, "Unknown endpoint", head_only)
@@ -861,6 +1080,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "authentication_configured": bool(PROXY_TOKEN),
             "ffmpeg": bool(FFMPEG),
             "ffprobe": bool(FFPROBE),
+            "subtitle_provider": "subdl",
+            "subtitles_configured": bool(SUBDL_API_KEY),
         }
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self._send_bytes(
@@ -918,6 +1139,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "authentication_configured": bool(PROXY_TOKEN),
             "ffmpeg": bool(FFMPEG),
             "ffprobe": bool(FFPROBE),
+            "subtitle_provider": "subdl",
+            "subtitles_configured": bool(SUBDL_API_KEY),
             "active_connections": snapshot.get("active_connections", 0),
             "active_ffmpeg": snapshot.get("active_ffmpeg", 0),
             "reasons": reasons,
@@ -1286,6 +1509,222 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 stop_process(process)
             self._release_ffmpeg_slot()
 
+    def _handle_subtitle_status(self, head_only: bool) -> None:
+        payload = {
+            "provider": "subdl",
+            "configured": bool(SUBDL_API_KEY),
+            "rate_limit_per_hour": SUBTITLE_RATE_LIMIT,
+        }
+        self._send_bytes(
+            200,
+            json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            "application/json; charset=utf-8",
+            head_only,
+        )
+
+    def _handle_subtitle_search(
+        self,
+        query: Mapping[str, List[str]],
+        head_only: bool,
+    ) -> None:
+        if not SUBDL_API_KEY:
+            return self._send_bytes(
+                503,
+                b'{"error":"not_configured","unavailable":true,"candidates":[]}',
+                "application/json; charset=utf-8",
+                head_only,
+            )
+        if head_only:
+            return self._send_bytes(200, b"", "application/json; charset=utf-8", True)
+        if not self._subtitle_rate_ok():
+            return self._send_bytes(
+                429,
+                b'{"error":"rate_limited","candidates":[]}',
+                "application/json; charset=utf-8",
+            )
+
+        kind = query.get("type", ["movie"])[0].strip().lower()
+        if kind not in {"movie", "tv"}:
+            kind = "movie"
+        title = query.get("title", [""])[0].strip()[:200]
+        imdb_id = query.get("imdb_id", [""])[0].strip()[:24]
+        tmdb_id = re.sub(r"\D", "", query.get("tmdb_id", [""])[0])[:20]
+        year_raw = re.sub(r"\D", "", query.get("year", [""])[0])[:4]
+        season_raw = re.sub(r"\D", "", query.get("season", [""])[0])[:4]
+        episode_raw = re.sub(r"\D", "", query.get("episode", [""])[0])[:4]
+
+        if imdb_id and not re.fullmatch(r"tt\d+", imdb_id, re.IGNORECASE):
+            imdb_id = ""
+        if not title and not imdb_id and not tmdb_id:
+            return self._send_bytes(
+                400,
+                b'{"error":"title_or_id_required","candidates":[]}',
+                "application/json; charset=utf-8",
+            )
+
+        languages: List[str] = []
+        for value in query.get("languages", ["NL,EN"])[0].split(","):
+            language = subtitle_language(value)
+            if re.fullmatch(r"[A-Z]{2,3}", language) and language not in languages:
+                languages.append(language)
+        if not languages:
+            languages = ["NL", "EN"]
+
+        params: Dict[str, object] = {
+            "type": kind,
+            "languages": ",".join(languages),
+            "unpack": 1,
+            "releases": 1,
+            "hi": 1,
+            "subs_per_page": 30,
+        }
+        if imdb_id:
+            params["imdb_id"] = imdb_id
+        elif tmdb_id:
+            params["tmdb_id"] = tmdb_id
+        else:
+            params["film_name"] = title
+        if year_raw:
+            params["year"] = year_raw
+        if season_raw:
+            params["season_number"] = season_raw
+        if episode_raw:
+            params["episode_number"] = episode_raw
+
+        try:
+            payload = subdl_request(params)
+            if payload.get("status") is False:
+                message = str(payload.get("error") or "subtitle provider rejected the request")[:200]
+                body = json.dumps(
+                    {"error": "provider_error", "message": message, "candidates": []},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                return self._send_bytes(502, body, "application/json; charset=utf-8")
+
+            season = int(season_raw) if season_raw else None
+            episode = int(episode_raw) if episode_raw else None
+            candidates = subtitle_candidates(payload, languages, season, episode)
+            results = payload.get("results")
+            matched: Dict[str, object] = {}
+            if isinstance(results, list) and results and isinstance(results[0], dict):
+                first = results[0]
+                matched = {
+                    "name": first.get("name") or "",
+                    "year": first.get("year"),
+                    "imdb_id": first.get("imdb_id") or "",
+                    "tmdb_id": first.get("tmdb_id") or "",
+                    "sd_id": first.get("sd_id") or "",
+                }
+
+            body = json.dumps(
+                {
+                    "provider": "subdl",
+                    "candidates": candidates,
+                    "matched": matched,
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self._send_bytes(200, body, "application/json; charset=utf-8")
+        except urllib.error.HTTPError as exc:
+            try:
+                exc.close()
+            except Exception:
+                pass
+            body = json.dumps(
+                {"error": f"provider_http_{exc.code}", "candidates": []}
+            ).encode("utf-8")
+            self._send_bytes(502, body, "application/json; charset=utf-8")
+        except Exception as exc:
+            log_event(
+                "error",
+                "subtitle_search_failed",
+                request_id=self.request_id,
+                error_type=type(exc).__name__,
+                error=str(exc)[:300],
+            )
+            body = json.dumps(
+                {
+                    "error": "provider_failed",
+                    "message": str(exc)[:160],
+                    "candidates": [],
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self._send_bytes(502, body, "application/json; charset=utf-8")
+
+    def _handle_subtitle_file(
+        self,
+        query: Mapping[str, List[str]],
+        head_only: bool,
+    ) -> None:
+        if not SUBDL_API_KEY:
+            return self._send_error_text(503, "subtitle provider is not configured", head_only)
+        if head_only:
+            return self._send_bytes(200, b"", "text/plain; charset=utf-8", True)
+        if not self._subtitle_rate_ok():
+            return self._send_error_text(429, "subtitle rate limit reached")
+
+        download_url = decode_subtitle_download_id(query.get("id", [""])[0].strip())
+        request = urllib.request.Request(
+            download_url,
+            headers={
+                "Accept": "application/zip, text/plain, application/octet-stream, */*",
+                "User-Agent": f"HaNeIPTV/{VERSION}",
+                "x-api-key": SUBDL_API_KEY,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=SUBTITLE_TIMEOUT) as response:
+                data = response.read(SUBTITLE_MAX_BYTES + 1)
+            if len(data) > SUBTITLE_MAX_BYTES:
+                return self._send_error_text(413, "subtitle file is too large")
+
+            filename = "subtitle.srt"
+            if data.startswith(b"PK\x03\x04"):
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    safe_files = [
+                        info
+                        for info in archive.infolist()
+                        if not info.is_dir()
+                        and info.filename.lower().endswith((".srt", ".vtt"))
+                        and info.file_size <= SUBTITLE_MAX_BYTES
+                    ]
+                    if not safe_files:
+                        return self._send_error_text(415, "archive contains no SRT or VTT subtitle")
+                    safe_files.sort(key=lambda info: (0 if info.filename.lower().endswith(".srt") else 1, info.file_size))
+                    selected = safe_files[0]
+                    filename = os.path.basename(selected.filename) or filename
+                    data = archive.read(selected)
+
+            text = decode_subtitle_bytes(data).replace("\x00", "")
+            if "-->" not in text:
+                return self._send_error_text(422, "downloaded file has no subtitle cues")
+            body = text.encode("utf-8")
+            self._send_bytes(
+                200,
+                body,
+                "text/plain; charset=utf-8",
+                cache_control="private, max-age=86400",
+                extra_headers=(("Content-Disposition", f'inline; filename="{safe_header_value(filename)}"'),),
+            )
+        except urllib.error.HTTPError as exc:
+            try:
+                exc.close()
+            except Exception:
+                pass
+            self._send_error_text(502, f"subtitle provider returned HTTP {exc.code}")
+        except zipfile.BadZipFile:
+            self._send_error_text(422, "subtitle archive is invalid")
+        except Exception as exc:
+            log_event(
+                "error",
+                "subtitle_download_failed",
+                request_id=self.request_id,
+                error_type=type(exc).__name__,
+                error=str(exc)[:300],
+            )
+            self._send_error_text(502, f"subtitle download failed: {type(exc).__name__}")
+
     def _handle_apk(self, head_only: bool) -> None:
         path = APK_PATH
         if not path:
@@ -1411,6 +1850,8 @@ def main() -> None:
         port=PORT,
         ffmpeg=FFMPEG or "not-found",
         ffprobe=FFPROBE or "not-found",
+        subtitle_provider="subdl",
+        subtitles_configured=bool(SUBDL_API_KEY),
         max_connections=MAX_CONNECTIONS,
         max_ffmpeg_jobs=MAX_FFMPEG_JOBS,
         authentication_required=REQUIRE_PROXY_TOKEN,
