@@ -47,14 +47,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", 8899))
 CHUNK = 64 * 1024
-# IPTV panels commonly gate streams by their User-Agent. Do not forward the
-# browser's Chrome/Render signature; use a configurable media-player signature
-# instead. Providers that require a specific value can override this safely in
-# Render with UPSTREAM_USER_AGENT (no credentials are stored in the app).
-FORWARD_REQ_HEADERS = ("range", "accept", "accept-language")
-UPSTREAM_USER_AGENT = os.environ.get(
-    "UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"
-).strip() or "VLC/3.0.20 LibVLC/3.0.20"
+# IPTV panels sometimes block particular media-player User-Agents. Preserve
+# the visitor's browser signature by default; an operator can still set
+# UPSTREAM_USER_AGENT in Render when a provider requires one specific value.
+FORWARD_REQ_HEADERS = ("range", "user-agent", "accept", "accept-language")
+UPSTREAM_USER_AGENT = os.environ.get("UPSTREAM_USER_AGENT", "").strip()
+DEFAULT_UPSTREAM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
 FORWARD_RES_HEADERS = ("content-type", "content-length", "content-range",
                        "accept-ranges", "last-modified", "etag")
 
@@ -670,7 +668,10 @@ class Proxy(BaseHTTPRequestHandler):
             v = self.headers.get(h)
             if v:
                 req.add_header(h, v)
-        req.add_header("User-Agent", UPSTREAM_USER_AGENT)
+        if UPSTREAM_USER_AGENT:
+            req.add_header("User-Agent", UPSTREAM_USER_AGENT)
+        elif not req.has_header("User-agent"):
+            req.add_header("User-Agent", DEFAULT_UPSTREAM_USER_AGENT)
 
         try:
             upstream = urllib.request.urlopen(req, timeout=20)
