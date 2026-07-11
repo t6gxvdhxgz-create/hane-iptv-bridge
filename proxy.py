@@ -24,11 +24,10 @@ Features:
 Run:
     python proxy.py [port]             # default 8899
 
-IMPORTANT - to help the HOSTED (https) app, the proxy itself must be reachable
-over https. Easiest free way (no VPS, no certificates):
-    cloudflared tunnel --url http://localhost:8899
-...then put the printed https://xxxx.trycloudflare.com URL into HTTP_PROXY in
-js/config.js. For local/TV use (http) you don't need this proxy at all.
+IMPORTANT - the hosted app needs this proxy to be permanently reachable over
+HTTPS. Deploy server.py to a service such as Render/Railway or behind a named
+Cloudflare Tunnel, then put that stable HTTPS hostname in js/config.js. Do not
+use a trycloudflare.com quick-tunnel in production: those URLs expire.
 """
 import glob
 import io
@@ -48,7 +47,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", 8899))
 CHUNK = 64 * 1024
-FORWARD_REQ_HEADERS = ("range", "user-agent", "accept")
+# IPTV panels commonly gate streams by their User-Agent. Do not forward the
+# browser's Chrome/Render signature; use a configurable media-player signature
+# instead. Providers that require a specific value can override this safely in
+# Render with UPSTREAM_USER_AGENT (no credentials are stored in the app).
+FORWARD_REQ_HEADERS = ("range", "accept", "accept-language")
+UPSTREAM_USER_AGENT = os.environ.get(
+    "UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"
+).strip() or "VLC/3.0.20 LibVLC/3.0.20"
 FORWARD_RES_HEADERS = ("content-type", "content-length", "content-range",
                        "accept-ranges", "last-modified", "etag")
 
@@ -310,6 +316,21 @@ class Proxy(BaseHTTPRequestHandler):
     # ── HTTP methods ─────────────────────────────────────────────────────
     def do_OPTIONS(self):
         self.send_response(204)
+        self._cors()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_HEAD(self):
+        # Render performs HEAD health checks. Reply successfully instead of
+        # reporting an unsupported-method error in every deployment log.
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in ("/", "/health"):
+            self.send_response(200)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
         self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -649,12 +670,21 @@ class Proxy(BaseHTTPRequestHandler):
             v = self.headers.get(h)
             if v:
                 req.add_header(h, v)
-        if not req.has_header("User-agent"):
-            req.add_header("User-Agent", "HaNeIPTV/1.0")
+        req.add_header("User-Agent", UPSTREAM_USER_AGENT)
 
         try:
             upstream = urllib.request.urlopen(req, timeout=20)
         except urllib.error.HTTPError as e:
+            # 456 is returned by some IPTV panels for account/IP/device limits.
+            # Keep the upstream code for the player, but log the sanitized
+            # reason and hostname so Render diagnostics identify the real side
+            # that rejected the request without leaking playlist credentials.
+            try:
+                detail = e.read(280).decode("utf-8", "replace").replace("\n", " ").strip()
+                host = urllib.parse.urlparse(target).hostname or "unknown"
+                sys.stderr.write("Upstream %s rejected request (%d): %s\n" % (host, e.code, detail[:220]))
+            except Exception:
+                pass
             return self._fail(e.code, "Upstream error %d" % e.code)
         except Exception as e:
             return self._fail(502, "Cannot reach panel: %s" % e)
