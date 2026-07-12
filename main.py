@@ -77,7 +77,8 @@ def env_bool(name: str, default: bool) -> bool:
     raise SystemExit(f"{name} must be 0/1, true/false, yes/no, or on/off")
 
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else env_int("PORT", 8899, 1, 65535)
+_cli_port = next((arg for arg in sys.argv[1:] if arg.isdigit()), None)
+PORT = int(_cli_port) if _cli_port else env_int("PORT", 8899, 1, 65535)
 BIND_HOST = os.environ.get("BIND_HOST", "0.0.0.0").strip() or "0.0.0.0"
 CHUNK_SIZE = env_int("CHUNK_SIZE", 128 * 1024, 16 * 1024, 4 * 1024 * 1024)
 CONNECT_TIMEOUT = env_float("CONNECT_TIMEOUT", 12.0, 1.0, 120.0)
@@ -112,7 +113,7 @@ APK_PATH = os.environ.get("APK_PATH", "").strip()
 
 SUBDL_API_KEY = os.environ.get(
     "SUBDL_API_KEY",
-    "subdl_dH3eDpdE9xNweEjifm-iFta7lx9LG_A9isSydmuxsaU",
+    "",
 ).strip()
 SUBDL_API_URL = os.environ.get(
     "SUBDL_API_URL",
